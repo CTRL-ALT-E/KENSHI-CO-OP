@@ -205,6 +205,10 @@ void mainLoop_hook(GameWorld* gw, float dt) {
             }
         }
         coopLog("SETUP: scene ready - arrange the pose and SAVE the game now");
+        // Any scene bakes automatically when KENSHICOOP_BAKESAVE is set (the
+        // bedcage arm above stays; this generalizes it to the other scenes).
+        if (!g_cfg.bakeSave.empty() && g_bakeSaveTick == 0)
+            g_bakeSaveTick = GetTickCount() + 8000; // let physics/grounding settle
     }
 
     // Deferred auto-bake: write the fixture save once the armed settle window

@@ -22,6 +22,16 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repo      = Split-Path -Parent $scriptDir
 
 $hostExe = Join-Path $HostDir "kenshi_x64.exe"
+# Fall back to scanning the other Steam libraries for the real install.
+if (-not (Test-Path $hostExe)) {
+    $vdf = "C:\Program Files (x86)\Steam\steamapps\libraryfolders.vdf"
+    if (Test-Path $vdf) {
+        foreach ($m in (Select-String -Path $vdf -Pattern '"path"\s+"([^"]+)"' -AllMatches).Matches) {
+            $cand = Join-Path ($m.Groups[1].Value -replace '\\\\', '\') "steamapps\common\Kenshi"
+            if (Test-Path (Join-Path $cand "kenshi_x64.exe")) { $HostDir = $cand; $hostExe = Join-Path $HostDir "kenshi_x64.exe"; break }
+        }
+    }
+}
 if (-not (Test-Path $hostExe)) { throw "Kenshi not found at $HostDir" }
 
 $saveRoot = Join-Path $env:LOCALAPPDATA "kenshi\save"

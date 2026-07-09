@@ -11,6 +11,17 @@ popd >nul
 
 set "KENSHI=%~1"
 if "%KENSHI%"=="" set "KENSHI=C:\Program Files (x86)\Steam\steamapps\common\Kenshi"
+REM If the default (or given) path has no game, scan common Steam-library locations so
+REM the harness works when Kenshi lives on a secondary drive/library.
+if not exist "%KENSHI%\kenshi_x64.exe" (
+    for %%D in (
+        "C:\Program Files (x86)\Steam\steamapps\common\Kenshi"
+        "C:\Program Files\Steam\steamapps\common\Kenshi"
+        "D:\SteamLibrary\steamapps\common\Kenshi"
+        "D:\Steam\steamapps\common\Kenshi"
+        "E:\SteamLibrary\steamapps\common\Kenshi"
+    ) do if exist "%%~D\kenshi_x64.exe" set "KENSHI=%%~D"
+)
 
 set "DLL=%REPO%\src\plugin\x64\Release\KenshiCoop.dll"
 set "JSON=%REPO%\dist\mods\KenshiCoop\RE_Kenshi.json"

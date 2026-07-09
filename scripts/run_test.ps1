@@ -127,6 +127,17 @@ if ($OutDir -eq "") {
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
 $hostExe = Join-Path $HostDir "kenshi_x64.exe"
+# The default HostDir assumes the primary Steam library; fall back to scanning
+# the other Steam libraries (libraryfolders.vdf) for the real install.
+if (-not (Test-Path $hostExe)) {
+    $vdf = "C:\Program Files (x86)\Steam\steamapps\libraryfolders.vdf"
+    if (Test-Path $vdf) {
+        foreach ($m in (Select-String -Path $vdf -Pattern '"path"\s+"([^"]+)"' -AllMatches).Matches) {
+            $cand = Join-Path ($m.Groups[1].Value -replace '\\\\', '\') "steamapps\common\Kenshi"
+            if (Test-Path (Join-Path $cand "kenshi_x64.exe")) { $HostDir = $cand; $hostExe = Join-Path $HostDir "kenshi_x64.exe"; break }
+        }
+    }
+}
 $joinExe = Join-Path $JoinDir "kenshi_x64.exe"
 if (-not (Test-Path $hostExe)) { throw "Host Kenshi not found: $hostExe" }
 if (-not (Test-Path $joinExe)) { throw "Join Kenshi not found: $joinExe (run scripts\setup_join_install.cmd)" }

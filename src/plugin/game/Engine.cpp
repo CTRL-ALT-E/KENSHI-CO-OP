@@ -520,6 +520,9 @@ typedef Item* (__fastcall* CreateItemFn)(
     GameData* matData, int levelOverride, Faction* flagUniform);
 // Inventory::equipItem (NON-virtual) - move a loose item into its equipment slot.
 typedef bool (__fastcall* EquipItemFn)(Inventory* self, Item* item);
+// RootObjectFactory::copyItem (NON-virtual) - clone an existing Item (works for WEAPONS,
+// unlike createItem). Requires a live source instance of the same template.
+typedef Item* (__fastcall* CopyItemFn)(RootObjectFactory* self, Item* from);
 // Inventory::getAllSections (NON-virtual): the canonical list of EVERY inventory
 // section. Worn gear lives in the equip SECTIONS (one per slot: each weapon, each
 // armour piece, belt, backpack, ...), NOT in the loose _allItems list. Walking all
@@ -546,6 +549,7 @@ CreateObjFn      g_createObjFn    = 0; // Phase W1 world-item proxy spawn
 DestroyObjFn     g_destroyObjFn   = 0; // Phase W1 world-item proxy cull
 GetDataOfTypeFn  g_getDataOfTypeFn = 0;
 CreateItemFn     g_createItemFn   = 0;
+CopyItemFn       g_copyItemFn     = 0;
 EquipItemFn      g_equipItemFn    = 0;
 GetAllSectionsFn g_getSectionsFn  = 0;
 GetWeaponFn      g_getPrimaryWeaponFn   = 0;
@@ -739,6 +743,8 @@ void resolve() {
             &RootObjectFactory::createItem));
     // Equipped-gear sync: equipItem is non-virtual, single overload.
     g_equipItemFn = (EquipItemFn)KenshiLib::GetRealAddress(&Inventory::equipItem);
+    // copyItem: clone an existing Item (the only factory path that instantiates weapons).
+    g_copyItemFn = (CopyItemFn)KenshiLib::GetRealAddress(&RootObjectFactory::copyItem);
     // Worn gear lives in equip sections, not _allItems: enumerate ALL sections and
     // keep the equipped ones (covers every slot, incl. weapons + worn backpack).
     g_getSectionsFn = (GetAllSectionsFn)KenshiLib::GetRealAddress(&Inventory::getAllSections);
@@ -1874,6 +1880,63 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
     return n;
 }
 
+// SEH-guarded: find a LIVE Item instance of template (sid, typeCat) already loaded in the
+// world, to serve as a copyItem() source (the only path that instantiates weapons). Scans,
+// in order: every player-squad member's inventory, then free ground items near the leader.
+// Returns the first matching Item*, or 0 if this template has no live instance to clone.
+Item* findLoadedItemByTemplate(GameWorld* gw, const char* sid, unsigned int typeCat) {
+    if (!gw || !gw->player || !sid || !sid[0]) return 0;
+    __try {
+        // 1) Player squad inventories. Loose items live in _allItems; EQUIPPED weapons do NOT -
+        // they hang off the dedicated primary/secondary weapon accessors - so check both.
+        unsigned int nsq = gw->player->playerCharacters.size();
+        for (unsigned int i = 0; i < nsq; ++i) {
+            Character* m = gw->player->playerCharacters[i]; if (!m) continue;
+            Inventory* inv = 0;
+            __try { inv = reinterpret_cast<RootObject*>(m)->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { inv = 0; }
+            if (!inv) continue;
+            __try {
+                lektor<Item*>& all = inv->_allItems;
+                unsigned int na = all.size();
+                for (unsigned int j = 0; j < na; ++j) {
+                    Item* it = all[j]; if (!it) continue;
+                    GameData* gd = it->getGameData(); if (!gd) continue;
+                    if ((unsigned int)gd->type == typeCat && strcmp(gd->stringID.c_str(), sid) == 0) return it;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            // Equipped primary/secondary weapon (not in _allItems).
+            if (typeCat == (unsigned int)WEAPON) {
+                Item* wpns[2] = { 0, 0 };
+                __try { if (g_getPrimaryWeaponFn) wpns[0] = g_getPrimaryWeaponFn(inv); if (g_getSecondaryWeaponFn) wpns[1] = g_getSecondaryWeaponFn(inv); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                for (int w = 0; w < 2; ++w) {
+                    Item* it = wpns[w]; if (!it) continue;
+                    GameData* gd = 0;
+                    __try { gd = it->getGameData(); } __except (EXCEPTION_EXECUTE_HANDLER) { gd = 0; }
+                    if (gd && (unsigned int)gd->type == typeCat && strcmp(gd->stringID.c_str(), sid) == 0) return it;
+                }
+            }
+        }
+        // 2) Free ground items near the leader.
+        if (g_getObjsFn && nsq > 0) {
+            Character* ld = gw->player->playerCharacters[0];
+            if (ld) {
+                Ogre::Vector3 center = ld->getPosition();
+                g_npcQuery.clear();
+                g_getObjsFn(gw, &g_npcQuery, &center, 60.0f, (itemType)typeCat, 256, 0);
+                unsigned int total = g_npcQuery.size();
+                for (unsigned int i = 0; i < total; ++i) {
+                    RootObject* o = g_npcQuery[i]; if (!o) continue;
+                    Item* it = reinterpret_cast<Item*>(o);
+                    GameData* gd = 0;
+                    __try { gd = it->getGameData(); } __except (EXCEPTION_EXECUTE_HANDLER) { gd = 0; }
+                    if (gd && (unsigned int)gd->type == typeCat && strcmp(gd->stringID.c_str(), sid) == 0) return it;
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
+}
+
 // SEH-guarded: find an item template by stringID within its itemType category.
 GameData* findItemTemplateImpl(GameWorld* gw, const char* sid, unsigned int typeCat) {
     if (!gw || !g_getDataOfTypeFn || !sid || !sid[0]) return 0;
@@ -1911,6 +1974,30 @@ bool createItemAndAdd(GameWorld* gw, Inventory* inv, const char* sid,
     static int dbg = -1;
     if (dbg < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dbg = (e && e[0] == '1') ? 1 : 0; }
     __try {
+        // WEAPON fast-path: the factory createItem cannot instantiate a weapon (see below), and
+        // a modded weapon's TEMPLATE may not even be in the data manager here (only a live Item
+        // carries it). copyItem() clones a live instance directly, so for weapons try that FIRST -
+        // it needs no data-manager template, just an existing instance of the same stringID.
+        if ((unsigned int)typeCat == (unsigned int)WEAPON && g_copyItemFn && gw->theFactory) {
+            Item* src = findLoadedItemByTemplate(gw, sid, typeCat);
+            if (src) {
+                Item* clone = 0;
+                __try { clone = g_copyItemFn(gw->theFactory, src); } __except (EXCEPTION_EXECUTE_HANDLER) { clone = 0; }
+                if (clone) {
+                    if (dbg) coop::logLine("[mk] weapon via copyItem fallback");
+                    if (qualityBucket > 0) { __try { clone->quality = (float)qualityBucket / 100.0f; } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+                    if (!inv->tryAddItem(clone, qty)) {
+                        if (dbg) { char b[120]; _snprintf(b,sizeof(b)-1,"[mk] wpn-clone add-fail sid='%s'",sid); b[sizeof(b)-1]='\0'; coop::logLine(b);} return false;
+                    }
+                    if (equip && g_equipItemFn) g_equipItemFn(inv, clone);
+                    if (dbg) { char b[120]; _snprintf(b,sizeof(b)-1,"[mk] OK(clone) sid='%s' equip=%d qty=%d",sid,equip?1:0,qty); b[sizeof(b)-1]='\0'; coop::logLine(b); }
+                    return true;
+                }
+            } else if (dbg) { char b[120]; _snprintf(b,sizeof(b)-1,"[mk] weapon no clone-source sid='%s'",sid); b[sizeof(b)-1]='\0'; coop::logLine(b); }
+            // No live source -> fall through; the factory path below will (expectedly) fail for
+            // this weapon, but keeping it lets the template-resolved manufacturer/material path
+            // run in case a future engine build allows it.
+        }
         GameData* tmpl = findItemTemplateImpl(gw, sid, typeCat);
         if (!tmpl) { if (dbg) coop::logLine("[mk] tmpl-null"); return false; }
         // A WEAPON needs its manufacturer (mesh/company) GameData or createItem returns
@@ -1924,13 +2011,11 @@ bool createItemAndAdd(GameWorld* gw, Inventory* inv, const char* sid,
         memset(buf, 0, sizeof(buf));
         hand* h = reinterpret_cast<hand*>(buf);
         g_handCtorFn(h, 0, 0, (itemType)typeCat, 0, 0); // blank handle (factory owns id)
+        // WEAPON note: for weapons the copyItem fast-path above already handled the case where a
+        // live clone-source exists. If we reach here for a weapon, createItem will return null
+        // (the factory hard-refuses WEAPON type - GameData->type==2 jumps to `xor eax,eax; ret` at
+        // RVA 0x57FCC0, Kenshi 1.0.65) and we correctly report failure. Armour/items allocate here.
         Item* it = g_createItemFn(gw->theFactory, tmpl, h, man, mat, -1, 0);
-        // NOTE (weapon limitation): the 6-arg factory createItem returns null for WEAPONS in
-        // this context even with the correct manufacturer+material (confirmed: 0/24 base
-        // weapon templates instantiate), while armour/items create fine. Newly-ACQUIRED
-        // weapons (loot/pickup/trade) therefore cannot yet be reconstructed on a peer; save-
-        // shared weapons still sync (they MOVE, never CREATE). Needs the engine's real
-        // weapon-spawn path (TODO) - tracked as a follow-up.
         if (!it) { if (dbg) { char b[140]; _snprintf(b,sizeof(b)-1,"[mk] createItem-null sid='%s' type=%u man=%d mat=%d",sid,typeCat,man?1:0,mat?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);} return false; }
         if (qualityBucket > 0) it->quality = (float)qualityBucket / 100.0f;
         if (!inv->tryAddItem(it, qty)) { if (dbg) { char b[120]; _snprintf(b,sizeof(b)-1,"[mk] tryAddItem-fail sid='%s' type=%u equip=%d",sid,typeCat,equip?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);} return false; } // virtual
