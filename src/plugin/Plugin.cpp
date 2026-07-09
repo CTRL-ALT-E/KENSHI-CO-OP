@@ -23,6 +23,7 @@
 
 #include <windows.h>
 #include <cstdio>
+#include <cstdlib> // getenv (KENSHICOOP_FAR_KINEMATIC escape hatch)
 #include <string>
 #include <deque>
 
@@ -200,8 +201,16 @@ void mainLoop_hook(GameWorld* gw, float dt) {
                 coopLog("SETUP: seat spawn FAILED (no seat template or createBuilding faulted)");
             }
             if (g_cfg.setupScene == "npc") {
-                Character* npc = coop::engine::spawnNpcInFront(gw, 2.5f, 1.0f);
-                coopLog(npc ? "SETUP: spawned world NPC" : "SETUP: NPC spawn FAILED");
+                // Spawn several world NPCs in a nearby NON-PLAYER faction, detached from
+                // town-AI so they idle in front of the leader instead of disbanding to
+                // jobs or being absorbed into the player squad (a player-faction spawn is
+                // excluded by isPlayerSquad, so only ~1 ever streams). This gives npc_sync
+                // the >= 4 co-present world NPCs it needs on both host and join.
+                unsigned int hands[8][5];
+                unsigned int spawned = coop::engine::spawnRuntimeSquad(gw, 6, hands);
+                char b2[64];
+                _snprintf(b2, sizeof(b2) - 1, "SETUP: spawned %u world NPCs (runtime squad)", spawned);
+                b2[sizeof(b2) - 1] = '\0'; coopLog(b2);
             }
         }
         coopLog("SETUP: scene ready - arrange the pose and SAVE the game now");
@@ -641,6 +650,20 @@ __declspec(dllexport) void startPlugin() {
     if (!g_cfg.isHost && g_cfg.noDetach) {
         g_repl.setNoDetach(true);
         coopLog("[quiet] KENSHICOOP_NO_DETACH=1: sitter detachFromTownAI SKIPPED (experiment)");
+    }
+
+    // Far-body kinematic fallback (join side, DEFAULT ON): a moving squad body the
+    // engine won't simulate (too far from the local player) is followed kinematically
+    // along the host's path instead of stutter-snapping. KENSHICOOP_FAR_KINEMATIC=0
+    // disables (A/B escape hatch).
+    if (!g_cfg.isHost) {
+        const char* fk = std::getenv("KENSHICOOP_FAR_KINEMATIC");
+        if (fk && fk[0] == '0') {
+            g_repl.setFarBodyKinematic(false);
+            coopLog("[far] KENSHICOOP_FAR_KINEMATIC=0: kinematic far-body fallback DISABLED");
+        } else {
+            coopLog("[far] far-body kinematic fallback ON (default; KENSHICOOP_FAR_KINEMATIC=0 disables)");
+        }
     }
 
     // Divergence-gated authority (join side, DEFAULT ON since the step-4 A/B):

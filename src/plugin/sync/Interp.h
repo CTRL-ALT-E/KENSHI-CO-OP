@@ -58,12 +58,24 @@ private:
     struct Snap {
         unsigned long t;
         float x, y, z, heading;
+        // Locomotion captured at the SAME instant as this transform. sample()
+        // renders the body in the PAST (render delay), so the motion state that
+        // belongs with the render-time POSITION is this snapshot's - NOT the newest
+        // snapshot's. Copying the newest cMoving/cSpeed onto a render-delayed
+        // position is the "snapshot cheats things" bug: on a stop the newest says
+        // cMoving=0 while the delayed position is still gliding to the stop point,
+        // so the engine plays idle on a translating body => foot-slide/jitter.
+        float         cSpeed, cMotionX, cMotionY, cMotionZ;
+        unsigned char cMoving;
     };
 
     static const int CAP = 16;
 
     const Snap& at(int i) const;     // i in [0, count_): 0 = oldest
     unsigned long renderDelay(const InterpConfig& cfg) const;
+    // Write the time-aligned locomotion (cSpeed/cMotion/cMoving) of snapshot 's'
+    // onto 'out', so the returned motion state matches the render-time position.
+    static void copyLoco(EntityState* out, const Snap& s);
 
     Snap          ring_[CAP];
     int           count_;

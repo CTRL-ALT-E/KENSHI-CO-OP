@@ -66,6 +66,12 @@ public:
     // default; flip for a manual A/B before deleting the detach lever for good.
     void setNoDetach(bool v) { noDetach_ = v; }
 
+    // Far-body kinematic fallback (KENSHICOOP_FAR_KINEMATIC, default ON): when a moving
+    // squad body is issued walk-orders but does not physically advance (it is too far
+    // from the local player for the engine to simulate its walk), stop stutter-snapping
+    // and drive it kinematically along the host's interpolated path. Set 0 to disable.
+    void setFarBodyKinematic(bool v) { farBodyKinematic_ = v; }
+
     // Damage guard (join side, default ON): every driven (non-owned) body joins the
     // hitByMeleeAttack-suppressed set each tick, so the join's cosmetic fights apply
     // no local damage - outcomes stay host-authoritative (KO/death events).
@@ -344,6 +350,25 @@ private:
                                       //   debounced owner-side-exit detector)
         // Stealth sync (protocol 20):
         unsigned long sneakTick;      // last setStealthMode apply (mode-flap throttle)
+        // Move/rest hysteresis: the raw moving test (cMoving flag OR cSpeed > MOVE_EPS)
+        // flickers as a body decelerates through the threshold, flipping walk-drive vs
+        // park every frame -> the on-stop jitter. Latch "moving" and only release to rest
+        // after several sustained near-still frames.
+        bool          movingLatched;  // current hysteretic moving/rest classification
+        unsigned int  stillFrames;    // consecutive near-still frames while latched moving
+        // NPC path uses a velocity-gated moving test (vlen > NPC_MOVE_VEL) instead of
+        // the squad's cMoving/cSpeed test, so it needs its own latch. Same shape: hold
+        // "moving" and only release after several sustained slow frames, so an NPC
+        // braking through NPC_MOVE_VEL doesn't flip walk-drive vs park every frame.
+        bool          npcMovingLatched;
+        unsigned int  npcStillFrames;
+        // Far-body streaming starvation (protocol/desync): a moving squad body that is
+        // issued walk-orders but does NOT physically advance (engine isn't simulating it
+        // - it's far outside the local player's live zone) accumulates lag until the
+        // gap>SNAP_DIST hard-snap, which reads as periodic teleport jumps. Detect the
+        // stall and drive it kinematically along the host's interpolated path instead.
+        bool          starved;        // currently in kinematic-follow fallback
+        unsigned int  stallFrames;    // consecutive frames issued-to-walk but not advancing
         Driven() : fresh(false), haveActual(false), lx(0), ly(0), lz(0), parked(false),
                    haveDest(false), dx(0), dy(0), dz(0),
                    suppressed(false), lastSeenMs(0),
@@ -356,7 +381,10 @@ private:
                    goalsCleared(false),
                    trusted(false), agreeStreak(0),
                    carryHealTick(0), carryNoSeeTick(0),
-                   furnHealTick(0), furnNoSeeTick(0), sneakTick(0) {}
+                   furnHealTick(0), furnNoSeeTick(0), sneakTick(0),
+                   movingLatched(false), stillFrames(0),
+                   npcMovingLatched(false), npcStillFrames(0),
+                   starved(false), stallFrames(0) {}
     };
 
     // Reproduce the host's rest pose on a driven body: if it carries a task whose
@@ -545,6 +573,9 @@ private:
     unsigned long        sitOrders_;      // applyTaskOrder issues (the sit/work APPLY lever)
     unsigned long        detachUses_;     // detachFromTownAI calls from applyRest (sitter path)
     bool                 noDetach_;       // KENSHICOOP_NO_DETACH=1: skip sitter detach (A/B experiment)
+    bool                 farBodyKinematic_; // KENSHICOOP_FAR_KINEMATIC (default ON): kinematic
+                                            //   follow for starved (unsimulated far) squad bodies
+    unsigned long        farKinEngages_;   // telemetry: kinematic-fallback engagements this run
 
     // Damage-guard state (join side): suppress local melee damage on driven bodies.
     bool                 dmgGuard_;

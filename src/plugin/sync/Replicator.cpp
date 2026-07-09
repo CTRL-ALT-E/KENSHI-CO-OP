@@ -47,7 +47,17 @@ const float CATCHUP_K   = 2.0f;   // gap-proportional speed boost (chase a movin
 const float REISSUE_DIST = 1.0f;  // re-issue the walk order only when tgt moved this far
 const float LEAD_SECONDS = 0.6f;  // project the walk target this far along source velocity
 const float NPC_MOVE_VEL = 0.75f; // NPC est. velocity (u/s) above which it is "walking"
+const float NPC_MOVE_VEL_LO = 0.40f; // hysteresis: once walking, only drop to rest below this
                                   // (vs a fidget/turn in place -> treat as at rest)
+const float MOVE_EPS_LO  = 0.10f; // hysteresis: once moving, only drop to rest below this
+const float REST_CORRECT_ALPHA = 0.20f; // at-rest: per-frame fraction bled toward the host
+                                        // transform (continuous soft correction, no dead band)
+const float REST_CORRECT_EPS   = 0.03f; // stop nudging once within 3 cm (converged)
+const float STARVE_GAP    = 2.5f; // gap (u) above which a non-advancing moving body is stalled
+const float STARVE_STEP   = 0.05f; // per-frame self-advance below which the body isn't moving
+const unsigned int STARVE_FRAMES = 15; // sustained stalled frames before kinematic fallback
+const float KIN_FOLLOW_ALPHA = 0.35f; // kinematic catch-up: fraction of gap-to-newest per frame
+const unsigned int STILL_FRAMES = 6; // ...and only after this many sustained near-still frames
 const unsigned long TASK_GRACE_MS = 4000;  // settle time before drift-checking a pose
 const float TASK_DRIFT_MAX = 4.0f;         // committed pose drift beyond which we park
 const unsigned long TASK_RETRY_MS = 1500;  // throttle between pose apply attempts
@@ -140,6 +150,7 @@ Replicator::Replicator()
       aiSuspend_(false), aiLogTick_(0), nextEventId_(1),
       nextWorldNetId_(1), nextDropId_(1), nextPickupId_(1), nextTreatId_(1),
       quietRelapse_(0), sitOrders_(0), detachUses_(0), noDetach_(false),
+      farBodyKinematic_(true), farKinEngages_(0),
       dmgGuard_(false), carrySync_(true), furnSync_(true), stealthSync_(true),
       gateAuthority_(false), trustLogTick_(0),
       trustGrants_(0), trustRevokes_(0),
@@ -2226,7 +2237,22 @@ void Replicator::applyTargets(GameWorld* gw) {
 
         float ax, ay, az;
         bool haveActual = engine::readPos(c, &ax, &ay, &az);
-        bool hostMoving = (out.cMoving != 0) || (out.cSpeed > MOVE_EPS);
+        // Hysteretic moving/rest classification. The raw test flickers as a body
+        // decelerates through MOVE_EPS (and the cMoving flag toggles), which flips the
+        // walk-drive vs park branches every frame => the heavy on-stop jitter. Latch
+        // "moving" on the raw signal, but only release to rest after several consecutive
+        // clearly-still frames (speed below a lower threshold, cMoving clear).
+        bool rawMoving = (out.cMoving != 0) || (out.cSpeed > MOVE_EPS);
+        if (rawMoving) {
+            d.movingLatched = true; d.stillFrames = 0;
+        } else if (d.movingLatched) {
+            if (out.cMoving == 0 && out.cSpeed < MOVE_EPS_LO) {
+                if (++d.stillFrames >= STILL_FRAMES) { d.movingLatched = false; d.stillFrames = 0; }
+            } else {
+                d.stillFrames = 0; // a near-threshold blip; keep waiting for sustained stillness
+            }
+        }
+        bool hostMoving = d.movingLatched;
 
         // Two drive regimes (see Engine::isLocalPlayerChar):
         //   * SQUAD member - a player-controlled body, inert when uncontrolled, so
@@ -2700,7 +2726,22 @@ void Replicator::applyTargets(GameWorld* gw) {
         // walk-vs-rest, and the smoothness oracle uses the same notion of "active"
         // so a correctly-held (parked) body is not counted as missed movement.
         float vlen = std::sqrt(vx * vx + vy * vy + vz * vz);
-        bool npcMoving = haveNewest && (vlen > NPC_MOVE_VEL);
+        // Hysteretic velocity gate (mirrors the squad hostMoving latch above): latch
+        // "walking" once vlen clears NPC_MOVE_VEL, and only release to rest after
+        // STILL_FRAMES sustained frames below the lower NPC_MOVE_VEL_LO. Without this an
+        // NPC decelerating through NPC_MOVE_VEL flips walk-drive vs park every frame ->
+        // the same on-stop jitter the squad path had before its hysteresis fix.
+        bool npcRawMoving = haveNewest && (vlen > NPC_MOVE_VEL);
+        if (npcRawMoving) {
+            d.npcMovingLatched = true; d.npcStillFrames = 0;
+        } else if (d.npcMovingLatched) {
+            if (haveNewest && vlen < NPC_MOVE_VEL_LO) {
+                if (++d.npcStillFrames >= STILL_FRAMES) { d.npcMovingLatched = false; d.npcStillFrames = 0; }
+            } else {
+                d.npcStillFrames = 0; // near-threshold blip; wait for sustained stillness
+            }
+        }
+        bool npcMoving = d.npcMovingLatched;
 
         // AI-suspend probe: for a host-driven world NPC, suspend its AI decision
         // layer (faction-safe) so it stops self-tasking but keeps animating. The
@@ -2774,6 +2815,45 @@ void Replicator::applyTargets(GameWorld* gw) {
             d.parked = false;
             d.haveDest = false;
         } else if (hostMoving) {
+            // ---- Far-body streaming starvation detection --------------------------
+            // A squad body far outside the local player's live zone is not simulated by
+            // the engine, so our walkTo is ignored: it sits still while the host stream
+            // keeps advancing, the gap grows, and it periodically hard-snaps (the visible
+            // "worse the further players stray" teleport jumps). Detect "issued to walk
+            // but not physically advancing while a real gap persists" and, once sustained,
+            // drive it KINEMATICALLY toward the host's interpolated position (the host's
+            // real, collision-valid path) so it follows smoothly instead of snap-lagging.
+            if (farBodyKinematic_ && !d.starved) {
+                float selfAdvance = (haveActual && d.haveActual)
+                                        ? dist3(ax, ay, az, d.lx, d.ly, d.lz) : 999.0f;
+                if (gapNewest > STARVE_GAP && selfAdvance < STARVE_STEP) {
+                    if (++d.stallFrames >= STARVE_FRAMES) {
+                        d.starved = true; ++farKinEngages_;
+                        char b[128]; _snprintf(b, sizeof(b) - 1,
+                            "[far] kinematic ENGAGE hand=%u,%u gap=%.2f",
+                            out.hIndex, out.hSerial, (double)gapNewest);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    }
+                } else {
+                    d.stallFrames = 0;
+                }
+            }
+
+            if (d.starved) {
+                // Kinematic follow: bleed toward the newest authoritative position each
+                // frame (smooth, no stutter). Cleared when the source stops (rest branch)
+                // or the body is back on target - re-evaluated fresh on the next move.
+                if (gapNewest < REPARK_DIST) {
+                    d.starved = false; d.stallFrames = 0;
+                } else if (haveActual && haveNewest) {
+                    EntityState k = newest;
+                    k.x = ax + (newest.x - ax) * KIN_FOLLOW_ALPHA;
+                    k.y = ay + (newest.y - ay) * KIN_FOLLOW_ALPHA;
+                    k.z = az + (newest.z - az) * KIN_FOLLOW_ALPHA;
+                    engine::applyRaw(c, k);
+                    d.parked = false; d.haveDest = false;
+                }
+            } else {
             // Engine-WALK toward a LEAD point ahead of the body - the fix for the
             // teleport-slide "float". Aiming at the (render-delayed) interp target
             // makes the char reach it instantly and stop, then wait for the target
@@ -2805,10 +2885,14 @@ void Replicator::applyTargets(GameWorld* gw) {
             d.parked = false;
             // No motion mirror while genuinely moving: the engine selects the
             // grounded walk clip itself from the locomotion it is performing.
+            }
         } else {
             // Squad member at rest: reproduce the host's pose (e.g. seated on the
             // same chair) at the same fixture, else quiet + park (Stage 5). This is
             // what makes a join squad-mate sit instead of standing on the chair.
+            // Source stopped: clear any starvation latch so the next move re-evaluates
+            // whether the body is being simulated again (self-heals when players regroup).
+            d.starved = false; d.stallFrames = 0;
             applyRest(c, d, out, haveActual, ax, ay, az, now, /*isSquad*/true);
             d.haveDest = false;
         }
@@ -3135,8 +3219,22 @@ void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
     if (!d.parked) {
         engine::endAction(c); // stop the residual walk -> idle (not march in place)
         if (engine::park(c, out.x, out.y, out.z, out.heading)) d.parked = true;
-    } else if (gapOut > REPARK_DIST) {
+    } else if (gapOut > SNAP_DIST) {
+        // Genuine teleport / large warp: hard-snap (converging softly would smear it
+        // visibly across the whole gap).
         engine::applyRaw(c, out);
+    } else if (haveActual && gapOut > REST_CORRECT_EPS) {
+        // Continuous soft correction (replaces the old hard REPARK_DIST=1u dead band).
+        // The old path ignored ALL drift under 1u then TELEPORTED past it - so a
+        // resting body could sit up to a metre off its true spot and then visibly pop.
+        // Instead bleed a fixed fraction of the gap each frame: error is drained
+        // continuously (no accumulation) and the body glides onto its spot (no pop).
+        // applyMotion(false) below keeps it idle, so this never reads as a walk/march.
+        EntityState nudged = out;
+        nudged.x = ax + (out.x - ax) * REST_CORRECT_ALPHA;
+        nudged.y = ay + (out.y - ay) * REST_CORRECT_ALPHA;
+        nudged.z = az + (out.z - az) * REST_CORRECT_ALPHA;
+        engine::applyRaw(c, nudged);
     }
     // I11: endAction once is not enough for every stander - some RE-ACQUIRE a
     // walk action after settling and march again. Re-quiet only when the body
@@ -3160,10 +3258,10 @@ void Replicator::logSmoothSummary() {
     float zeroFrac = (activeFrames_ > 0)
                          ? (float)zeroWhileActive_ / (float)activeFrames_
                          : 0.0f;
-    char b[160];
+    char b[192];
     _snprintf(b, sizeof(b) - 1,
-              "SCENARIO SMOOTH active=%lu zeroWhileActive=%lu zeroFrac=%.3f maxStep=%.3f",
-              activeFrames_, zeroWhileActive_, zeroFrac, maxStep_);
+              "SCENARIO SMOOTH active=%lu zeroWhileActive=%lu zeroFrac=%.3f maxStep=%.3f farKin=%lu",
+              activeFrames_, zeroWhileActive_, zeroFrac, maxStep_, farKinEngages_);
     b[sizeof(b) - 1] = '\0';
     coop::logLine(b);
 

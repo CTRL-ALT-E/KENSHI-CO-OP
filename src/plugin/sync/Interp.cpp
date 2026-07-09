@@ -35,6 +35,12 @@ const EntityInterp::Snap& EntityInterp::at(int i) const {
     return ring_[idx];
 }
 
+void EntityInterp::copyLoco(EntityState* out, const Snap& s) {
+    out->cSpeed  = s.cSpeed;
+    out->cMotionX = s.cMotionX; out->cMotionY = s.cMotionY; out->cMotionZ = s.cMotionZ;
+    out->cMoving = s.cMoving;
+}
+
 void EntityInterp::push(const EntityState& e, unsigned long nowMs) {
     // Track inter-arrival interval + jitter (EMA) to size the render delay.
     if (lastArrival_ != 0) {
@@ -49,6 +55,10 @@ void EntityInterp::push(const EntityState& e, unsigned long nowMs) {
     Snap s;
     s.t = nowMs;
     s.x = e.x; s.y = e.y; s.z = e.z; s.heading = e.heading;
+    // Time-stamp the locomotion alongside the transform (see Snap in Interp.h).
+    s.cSpeed  = e.cSpeed;
+    s.cMotionX = e.cMotionX; s.cMotionY = e.cMotionY; s.cMotionZ = e.cMotionZ;
+    s.cMoving = e.cMoving;
     ring_[head_] = s;
     head_ = (head_ + 1) % CAP;
     if (count_ < CAP) ++count_;
@@ -112,6 +122,7 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
     if (count_ == 1) {
         out->x = newest.x; out->y = newest.y; out->z = newest.z;
         out->heading = newest.heading;
+        copyLoco(out, newest);
         return true;
     }
 
@@ -121,6 +132,7 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
     if (renderTime <= oldest.t) {
         out->x = oldest.x; out->y = oldest.y; out->z = oldest.z;
         out->heading = oldest.heading;
+        copyLoco(out, oldest);
         return true;
     }
 
@@ -134,13 +146,36 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
         if (seg <= 0.0f) {
             out->x = newest.x; out->y = newest.y; out->z = newest.z;
             out->heading = newest.heading;
+            copyLoco(out, newest);
             return true;
         }
         float k = (float)ahead / seg; // extrapolation factor along last segment
+
+        // Deceleration damping. Extrapolating the last segment's velocity assumes the body
+        // keeps moving. When it STOPS, that assumption overshoots the real stop point, and
+        // the next (stopped) snapshot then snaps it back - visible rubber-banding exactly on
+        // stop. Detect deceleration (last segment slower than the one before) and scale the
+        // extrapolation down by the fraction of speed retained, so a full stop extrapolates
+        // ~nothing while steady motion is unaffected.
+        if (count_ >= 3) {
+            const Snap& prev2 = at(count_ - 3);
+            float prevSeg = (float)(prev.t - prev2.t);
+            if (prevSeg > 0.0f) {
+                float dxL = newest.x - prev.x, dzL = newest.z - prev.z;
+                float dxP = prev.x - prev2.x,  dzP = prev.z - prev2.z;
+                float vLast = std::sqrt(dxL * dxL + dzL * dzL) / seg;
+                float vPrev = std::sqrt(dxP * dxP + dzP * dzP) / prevSeg;
+                if (vPrev > 0.0f && vLast < vPrev) k *= (vLast / vPrev);
+            }
+        }
+
         out->x = newest.x + (newest.x - prev.x) * k;
         out->y = newest.y + (newest.y - prev.y) * k;
         out->z = newest.z + (newest.z - prev.z) * k;
         out->heading = lerpAngle(prev.heading, newest.heading, 1.0f + k);
+        // Extrapolating off the newest segment: the newest snapshot's motion state
+        // is the one that belongs with this projected-forward position.
+        copyLoco(out, newest);
         return true;
     }
 
@@ -155,6 +190,7 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
             if (dx * dx + dy * dy + dz * dz > cfg.snapDistSq) {
                 out->x = s1.x; out->y = s1.y; out->z = s1.z;
                 out->heading = s1.heading;
+                copyLoco(out, s1); // snapped to the newer end -> its motion state
                 return true;
             }
             float span = (float)(s1.t - s0.t);
@@ -163,6 +199,16 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
             out->y = lerpf(s0.y, s1.y, a);
             out->z = lerpf(s0.z, s1.z, a);
             out->heading = lerpAngle(s0.heading, s1.heading, a);
+            // Continuous motion (speed/world-motion) interpolates within the segment;
+            // the moving FLAG follows the segment's start - so a body still traversing
+            // the last pre-stop segment reads "moving" (matching its gliding position)
+            // and only flips to idle once the render time crosses into the stopped
+            // segment. This is the time-alignment that kills on-stop foot-slide.
+            out->cSpeed  = lerpf(s0.cSpeed,  s1.cSpeed,  a);
+            out->cMotionX = lerpf(s0.cMotionX, s1.cMotionX, a);
+            out->cMotionY = lerpf(s0.cMotionY, s1.cMotionY, a);
+            out->cMotionZ = lerpf(s0.cMotionZ, s1.cMotionZ, a);
+            out->cMoving = s0.cMoving;
             return true;
         }
     }
@@ -170,6 +216,7 @@ bool EntityInterp::sample(unsigned long nowMs, const InterpConfig& cfg, EntitySt
     // Fallback (shouldn't hit): newest pose.
     out->x = newest.x; out->y = newest.y; out->z = newest.z;
     out->heading = newest.heading;
+    copyLoco(out, newest);
     return true;
 }
 
