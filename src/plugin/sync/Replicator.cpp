@@ -57,6 +57,21 @@ const float STARVE_GAP    = 2.5f; // gap (u) above which a non-advancing moving 
 const float STARVE_STEP   = 0.05f; // per-frame self-advance below which the body isn't moving
 const unsigned int STARVE_FRAMES = 15; // sustained stalled frames before kinematic fallback
 const float KIN_FOLLOW_ALPHA = 0.35f; // kinematic catch-up: fraction of gap-to-newest per frame
+const float CATCHUP_REF_SPEED = 6.0f; // host speed at/above which catch-up + lead run at full
+                                      // strength; below it they taper to 0 as the host stops, so
+                                      // the driven body converges to the host's velocity instead
+                                      // of overrunning the stop point and snapping back (rubberband)
+const float SETTLE_VEL     = 4.0f;  // TRANSLATION velocity (u/s, from the snapshot stream - NOT the
+                                    // host's cSpeed field, which decays slowly and lies during a
+                                    // stop) below which the source is treated as halting: HOLD the
+                                    // body on the authoritative pos (soft-pull) instead of walk-
+                                    // driving, so it can't coast past the stop and then snap back
+const float SNAP_GLIDE_ALPHA = 0.34f; // soft-pull fraction for a large gap: closes fast but GLIDES
+const float WARP_DIST      = 30.0f; // gap above which we still hard-snap instantly (a genuine warp)
+const float MAX_CATCHUP_STEP = 0.40f; // at-stop glide-in: max per-frame move toward the mark (~24
+                                      // u/s), CONSTANT speed - no big first-frame jump (proportional
+                                      // glide's first step off an ~8u lag reads as a snap), so the
+                                      // body covers the residual smoothly, like walking into place
 const unsigned int STILL_FRAMES = 6; // ...and only after this many sustained near-still frames
 const unsigned long TASK_GRACE_MS = 4000;  // settle time before drift-checking a pose
 const float TASK_DRIFT_MAX = 4.0f;         // committed pose drift beyond which we park
@@ -2779,15 +2794,22 @@ void Replicator::applyTargets(GameWorld* gw) {
                 engine::applyRaw(c, newest);
                 d.parked = false; d.haveDest = false;
             } else if (npcMoving) {
+                // Deceleration taper (mirrors the squad path): shrink lead + catch-up +
+                // cap as the NPC slows, so it converges to the host's velocity at the
+                // stop instead of overrunning and snapping back. NPCs are velocity-gated,
+                // so taper off the estimated speed vlen rather than cSpeed.
+                float speedFrac = vlen / CATCHUP_REF_SPEED;
+                if (speedFrac > 1.0f) speedFrac = 1.0f;
+                if (speedFrac < 0.0f) speedFrac = 0.0f;
                 float tx = newest.x, ty = newest.y, tz = newest.z;
-                float lead = vlen * LEAD_SECONDS;
+                float lead = vlen * LEAD_SECONDS * speedFrac;
                 tx += vx / vlen * lead; ty += vy / vlen * lead; tz += vz / vlen * lead;
                 float moved = d.haveDest ? dist3(tx, ty, tz, d.dx, d.dy, d.dz)
                                          : (REISSUE_DIST + 1.0f);
                 if (moved > REISSUE_DIST) {
-                    float spd = out.cSpeed + gapNewest * CATCHUP_K;
+                    float spd = out.cSpeed + gapNewest * CATCHUP_K * speedFrac;
                     float base = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
-                    float cap = base * 2.5f;
+                    float cap = base * (1.0f + 1.5f * speedFrac); // 2.5x cruise -> 1x stop
                     if (spd > cap) spd = cap;
                     engine::walkTo(c, tx, ty, tz, spd);
                     d.haveDest = true; d.dx = tx; d.dy = ty; d.dz = tz;
@@ -2808,9 +2830,11 @@ void Replicator::applyTargets(GameWorld* gw) {
                 applyRest(c, d, out, haveActual, ax, ay, az, now, /*isSquad*/false);
                 d.haveDest = false;
             }
-        } else if (hostMoving && haveActual && haveNewest && gapNewest > SNAP_DIST) {
-            // Fell behind / source warped: hard-snap to the true position (no-halt
-            // teleport keeps the clip phase advancing rather than freezing).
+        } else if (hostMoving && haveActual && haveNewest && gapNewest > WARP_DIST) {
+            // Genuine warp (huge gap - a door/fast-travel jump): hard-snap instantly; a
+            // glide across tens of metres would look worse than the teleport. Every
+            // smaller gap (fell behind, or coasted past a stop) now GLIDES below instead
+            // of teleporting - that was the residual on-stop snap.
             engine::applyRaw(c, newest);
             d.parked = false;
             d.haveDest = false;
@@ -2853,6 +2877,44 @@ void Replicator::applyTargets(GameWorld* gw) {
                     engine::applyRaw(c, k);
                     d.parked = false; d.haveDest = false;
                 }
+            } else if (vlen < SETTLE_VEL) {
+                // Halting settle, gated on the TRUE translation velocity (vlen from the
+                // snapshot stream), NOT out.cSpeed. The host's cSpeed field decays slowly
+                // and still reads several u/s for many frames AFTER the body has physically
+                // stopped (measured), so a cSpeed gate keeps walk-driving through the stop
+                // and the engine coasts the body PAST the mark on momentum, then it hard-
+                // snaps: THE on-stop snap. vlen collapses the instant the source stops, so
+                // gating on it HOLDS the body the moment real motion ceases - it can neither
+                // coast past nor teleport. Soft-pull works either direction (back an
+                // overshoot, forward a lag); a large gap glides quicker but never snaps.
+                // parked=true lets the rest branch continue the identical settle on release.
+                if (!d.parked) { engine::endAction(c); d.parked = true; }
+                if (haveActual && haveNewest) {
+                    EntityState k = newest;
+                    if (gapNewest > MAX_CATCHUP_STEP) {
+                        // Constant-speed glide-in: move a fixed small distance toward the
+                        // mark each frame (no big first-frame jump off a large lag = no snap).
+                        float f = MAX_CATCHUP_STEP / gapNewest;
+                        k.x = ax + (newest.x - ax) * f;
+                        k.y = ay + (newest.y - ay) * f;
+                        k.z = az + (newest.z - az) * f;
+                    } // else already within one step: settle exactly onto the mark
+                    engine::applyRaw(c, k);
+                }
+                d.haveDest = false;
+            } else if (gapNewest > SNAP_DIST) {
+                // Still translating but fell far behind (host outran the body's max walk
+                // speed - the fast-run catch-up case). Glide fast toward the authoritative
+                // position instead of teleporting, so catching up is smooth rather than a
+                // chunk-snap. Only a genuine warp (> WARP_DIST, handled above) teleports.
+                if (haveActual && haveNewest) {
+                    EntityState k = newest;
+                    k.x = ax + (newest.x - ax) * SNAP_GLIDE_ALPHA;
+                    k.y = ay + (newest.y - ay) * SNAP_GLIDE_ALPHA;
+                    k.z = az + (newest.z - az) * SNAP_GLIDE_ALPHA;
+                    engine::applyRaw(c, k);
+                }
+                d.parked = false; d.haveDest = false;
             } else {
             // Engine-WALK toward a LEAD point ahead of the body - the fix for the
             // teleport-slide "float". Aiming at the (render-delayed) interp target
@@ -2863,10 +2925,20 @@ void Replicator::applyTargets(GameWorld* gw) {
             // speed converges it, and when the source halts the lead collapses so it
             // settles exactly. Re-issued only when the lead point moves enough (the
             // player move-order recomputes the path, so per-frame re-issue stutters).
+            // Deceleration taper: as the host slows to a stop its (time-aligned)
+            // cSpeed falls, so shrink the lead, the gap catch-up boost, and the speed
+            // cap in lockstep. Without this the body keeps aiming at a lead point ahead
+            // of the stop and is allowed to run at up to base*2.5 (base floored at 12)
+            // while the host is nearly stopped - it overshoots, then the rest-entry park
+            // snaps it back: the stop rubberband. speedFrac ~1 at cruise, ->0 at halt.
+            float speedFrac = out.cSpeed / CATCHUP_REF_SPEED;
+            if (speedFrac > 1.0f) speedFrac = 1.0f;
+            if (speedFrac < 0.0f) speedFrac = 0.0f;
+
             float tx = newest.x, ty = newest.y, tz = newest.z;
             float vlen = std::sqrt(vx * vx + vy * vy + vz * vz);
             if (vlen > 0.01f) {
-                float lead = vlen * LEAD_SECONDS;
+                float lead = vlen * LEAD_SECONDS * speedFrac;
                 tx += vx / vlen * lead;
                 ty += vy / vlen * lead;
                 tz += vz / vlen * lead;
@@ -2874,10 +2946,9 @@ void Replicator::applyTargets(GameWorld* gw) {
             float moved = d.haveDest ? dist3(tx, ty, tz, d.dx, d.dy, d.dz)
                                      : (REISSUE_DIST + 1.0f);
             if (moved > REISSUE_DIST) {
-                float spd = out.cSpeed;
-                spd += gapNewest * CATCHUP_K;
+                float spd = out.cSpeed + gapNewest * CATCHUP_K * speedFrac;
                 float base = (out.cSpeed > 1.0f) ? out.cSpeed : 12.0f;
-                float cap = base * 2.5f;
+                float cap = base * (1.0f + 1.5f * speedFrac); // 2.5x at cruise -> 1x at stop
                 if (spd > cap) spd = cap;
                 engine::walkTo(c, tx, ty, tz, spd);
                 d.haveDest = true; d.dx = tx; d.dy = ty; d.dz = tz;

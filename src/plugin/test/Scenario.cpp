@@ -235,6 +235,84 @@ private:
 
 const float LeaderMoveScenario::LEG = 14.0f;
 
+// stop_probe: like leader_move but purpose-built to expose ON-STOP behaviour in the
+// driven copy. The HOST walks its squad leader out a fixed leg, lets it ARRIVE and
+// FULLY STOP (issues the move once, then holds the same destination for several
+// seconds so the body actually comes to rest), then walks back, stops, and repeats
+// for a long window. Because the walk order is issued ONCE per leg (not re-spammed)
+// the host body decelerates to a natural halt exactly like a player right-click - so
+// the JOIN's walk-driven copy must reproduce that stop, which is where the overshoot/
+// rubberband shows up. The long duration + short cycle means a late-loading join
+// (heavy modlists load minutes after the host) still overlaps many clean walk->STOP
+// cycles. Diagnostic, not a tight gate: read the join's per-frame [drv] trace
+// (KENSHICOOP_DRIVEDBG=1) at each stop, plus the standard smoothness/crosscheck.
+class StopProbeScenario : public Scenario {
+public:
+    StopProbeScenario()
+        : passed_(false), recvCount_(0), lastLogMs_(0),
+          haveStart_(false), issued_(false), lx_(0), lz_(0),
+          sx_(0), sy_(0), sz_(0) {}
+
+    virtual const char* name() const { return "stop_probe"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        if (ctx.isHost) {
+            Character* ld = engine::leader(ctx.gw);
+            if (ld && engine::readPos(ld, &sx_, &sy_, &sz_)) haveStart_ = true;
+        }
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // Host: drive the leader out-and-back with a real stop at each end. Issue the
+        // move ONCE per leg (only when the leg target changes) so the engine walks to
+        // it and decelerates to a natural halt - re-issuing every tick would restart
+        // the path and mask the very stop we are measuring.
+        if (ctx.isHost && haveStart_) {
+            Character* ld = engine::leader(ctx.gw);
+            if (ld) {
+                unsigned long ph = ctx.elapsedMs % CYCLE_MS;
+                bool outLeg = ph < (CYCLE_MS / 2);
+                float tx = outLeg ? (sx_ + LEG) : sx_;
+                float tz = outLeg ? (sz_ + LEG) : sz_;
+                if (!issued_ || tx != lx_ || tz != lz_) {
+                    engine::orderMoveTo(ld, tx, sy_, tz);
+                    issued_ = true; lx_ = tx; lz_ = tz;
+                }
+            }
+        }
+
+        // 2 Hz MEMBER/RECV lines for the runner's cross-check + screenshot anchor.
+        if (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            Character* ld = engine::leader(ctx.gw);
+            if (ctx.isHost) logScenarioLine("MEMBER", ld);
+            else if (logScenarioLine("RECV", ld)) ++recvCount_;
+        }
+
+        if (ctx.elapsedMs >= DURATION_MS) {
+            passed_ = ctx.isHost ? (engine::leader(ctx.gw) != 0) : (recvCount_ >= 1);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long DURATION_MS = 120000; // long: a late join still overlaps stops
+    static const unsigned long CYCLE_MS    = 12000;  // out(+arrive/hold) then back(+arrive/hold)
+    static const float         LEG;                  // leg length - long enough to reach cruise
+    bool          passed_;
+    unsigned int  recvCount_;
+    unsigned long lastLogMs_;
+    bool          haveStart_;
+    bool          issued_;
+    float         lx_, lz_;       // last issued leg target (dedupe re-issue)
+    float         sx_, sy_, sz_;  // start pose
+};
+
+const float StopProbeScenario::LEG = 15.0f;
+
 // npc_sync (Stage 4): the HOST streams nearby world NPCs (host-authoritative);
 // the JOIN resolves each by hand and drives it (walk-drive while moving, park +
 // AI-quiet at rest). Neither side scripts the NPCs - they do their own bar AI -
@@ -5597,6 +5675,7 @@ private:
 Scenario* makeScenario(const std::string& name) {
     if (name == "spike")        return new SpikeScenario();
     if (name == "leader_move")  return new LeaderMoveScenario();
+    if (name == "stop_probe")   return new StopProbeScenario();
     if (name == "coop_presence") return new CoopPresenceScenario();
     if (name == "split_interest") return new SplitInterestScenario();
     if (name == "npc_sync")     return new NpcSyncScenario();
